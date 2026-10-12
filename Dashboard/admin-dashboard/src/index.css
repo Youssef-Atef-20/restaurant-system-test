@@ -1,0 +1,153 @@
+@import url("https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;900&family=IBM+Plex+Mono:wght@400;500&display=swap");
+@import "tailwindcss";
+
+
+/* ============================================================
+   Design Tokens
+   ============================================================ */
+
+:root {
+  /* Palette — warm neutral with amber accent for a restaurant feel */
+  --color-bg:        #fafaf8;
+  --color-surface:   #ffffff;
+  --color-surface-2: #f5f4f1;
+  --color-border:    #e8e6e1;
+  --color-border-2:  #d4d2cc;
+
+  --color-text:      #3d3c38;
+  --color-text-2:    #7a7870;
+  --color-text-3:    #a8a6a0;
+
+  --color-accent:    #c2700a;
+  --color-accent-h:  #a85c05;
+  --color-accent-bg: rgba(194, 112, 10, 0.08);
+  --color-accent-border: rgba(194, 112, 10, 0.25);
+
+  --color-success:   #1a6b3a;
+  --color-success-bg: rgba(26, 107, 58, 0.08);
+  --color-danger:    #c0392b;
+  --color-danger-bg: rgba(192, 57, 43, 0.08);
+  --color-warning:   #b7770a;
+  --color-warning-bg: rgba(183, 119, 10, 0.08);
+
+  --shadow-sm:  0 1px 2px rgba(0,0,0,.05);
+  --shadow-md:  0 2px 8px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-lg:  0 8px 24px rgba(0,0,0,.10), 0 2px 6px rgba(0,0,0,.05);
+
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  16px;
+  --radius-xl:  22px;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+
+  --sidebar-w: 240px;
+  --topbar-h:  60px;
+
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Dark mode */
+.dark {
+  --color-bg:        #111110;
+  --color-surface:   #1a1918;
+  --color-surface-2: #222120;
+  --color-border:    #2e2d2a;
+  --color-border-2:  #3d3c38;
+
+  --color-text:      #e8e6e0;
+  --color-text-2:    #9e9b92;
+  --color-text-3:    #6b6963;
+
+  --color-accent:    #e08836;
+  --color-accent-h:  #f09840;
+  --color-accent-bg: rgba(224, 136, 54, 0.12);
+  --color-accent-border: rgba(224, 136, 54, 0.3);
+
+  --color-success:   #34c46e;
+  --color-success-bg: rgba(52, 196, 110, 0.10);
+  --color-danger:    #e05c4a;
+  --color-danger-bg: rgba(224, 92, 74, 0.10);
+  --color-warning:   #e8a838;
+  --color-warning-bg: rgba(232, 168, 56, 0.10);
+
+  --shadow-sm:  0 1px 2px rgba(0,0,0,.25);
+  --shadow-md:  0 2px 8px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.2);
+  --shadow-lg:  0 8px 24px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.25);
+}
+
+/* ============================================================
+   Base Reset
+   ============================================================ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  direction: rtl;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body { margin: 0; }
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 100%;
+  text-align: initial;
+  border-inline: none;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  margin: 0;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+p { margin: 0; }
+a { color: inherit; text-decoration: none; }
+
+input, textarea, select, button { font-family: inherit; }
+
+/* ============================================================
+   Scrollbar (subtle)
+   ============================================================ */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-2); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-3); }
+
+/* ============================================================
+   Transitions
+   ============================================================ */
+.transition-base {
+  transition: all 220ms var(--ease-spring);
+}
+
+/* ============================================================
+   Focus ring (accessibility)
+   ============================================================ */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ============================================================
+   AOS Override — faster & subtler
+   ============================================================ */
+[data-aos] {
+  transition-duration: 500ms !important;
+  transition-timing-function: var(--ease-spring) !important;
+}
