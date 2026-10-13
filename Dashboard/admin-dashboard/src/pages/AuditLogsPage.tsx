@@ -491,7 +491,7 @@ export function AuditLogsPage() {
             <div className="relative">
               <Input
                 id="audit-search"
-                placeholder="Search by user or item..."
+                placeholder="Search by item..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 leftIcon={<Search size={15} className="text-[var(--color-text-3)]" />}
