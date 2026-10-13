@@ -253,5 +253,4 @@ npm run build
 
 ## 📄 License & Commercial Terms
 This product is sold as a commercial source code package. Buyers receive full source code access to customize, rebrand, and deploy for their clients or commercial operations.
-#   r e s t a u r a n t - s y s t e m - t e s t  
- 
+#
