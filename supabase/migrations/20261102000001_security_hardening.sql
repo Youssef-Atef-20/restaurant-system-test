@@ -7,7 +7,8 @@
 -- 1. Persistent, Distributed Rate Limiting Table & Function
 -- 2. Function Execution Privilege Revocations & Grants
 -- 3. Search Path Hardening
--- 4. Table-Level Privilege Hardening
+-- 4. Cross-Tenant Child Record Boundary Hardening
+-- 5. Table-Level Privilege Hardening
 -- ============================================================
 
 -- ============================================================
@@ -33,7 +34,7 @@ REVOKE ALL ON TABLE public.rate_limits FROM anon;
 REVOKE ALL ON TABLE public.rate_limits FROM authenticated;
 GRANT ALL ON TABLE public.rate_limits TO service_role;
 
--- Atomic sliding-window rate limit checker
+-- Atomic, race-condition-proof sliding-window rate limit checker
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
   p_key text,
   p_max_attempts integer,
@@ -57,33 +58,43 @@ BEGIN
   WHERE window_start < (v_now - interval '1 day') 
     AND (locked_until IS NULL OR locked_until < v_now);
 
+  -- Atomic concurrency handling: ensure row exists without unique violation race
+  INSERT INTO public.rate_limits (key, attempts, window_start, locked_until)
+  VALUES (p_key, 0, v_now, NULL)
+  ON CONFLICT (key) DO NOTHING;
+
+  -- Row is guaranteed to exist: lock it for update
   SELECT * INTO v_rec
   FROM public.rate_limits
   WHERE key = p_key
   FOR UPDATE;
 
-  IF NOT FOUND THEN
-    INSERT INTO public.rate_limits (key, attempts, window_start, locked_until)
-    VALUES (p_key, 1, v_now, NULL);
+  -- 1. Check if locked out
+  IF v_rec.locked_until IS NOT NULL THEN
+    IF v_rec.locked_until > v_now THEN
+      v_remaining_lockout := CEIL(EXTRACT(EPOCH FROM (v_rec.locked_until - v_now)))::integer;
+      RETURN jsonb_build_object(
+        'allowed', false,
+        'remaining_attempts', 0,
+        'retry_after', GREATEST(v_remaining_lockout, 1)
+      );
+    ELSE
+      -- Lockout has expired: reset window and clear lockout
+      UPDATE public.rate_limits
+      SET attempts = 1,
+          window_start = v_now,
+          locked_until = NULL
+      WHERE key = p_key;
 
-    RETURN jsonb_build_object(
-      'allowed', true,
-      'remaining_attempts', GREATEST(p_max_attempts - 1, 0),
-      'retry_after', 0
-    );
+      RETURN jsonb_build_object(
+        'allowed', true,
+        'remaining_attempts', GREATEST(p_max_attempts - 1, 0),
+        'retry_after', 0
+      );
+    END IF;
   END IF;
 
-  -- Check if currently locked out
-  IF v_rec.locked_until IS NOT NULL AND v_rec.locked_until > v_now THEN
-    v_remaining_lockout := CEIL(EXTRACT(EPOCH FROM (v_rec.locked_until - v_now)))::integer;
-    RETURN jsonb_build_object(
-      'allowed', false,
-      'remaining_attempts', 0,
-      'retry_after', v_remaining_lockout
-    );
-  END IF;
-
-  -- Check if current window has expired
+  -- 2. Check if current window has expired
   IF v_now > (v_rec.window_start + v_window_interval) THEN
     UPDATE public.rate_limits
     SET attempts = 1,
@@ -98,7 +109,7 @@ BEGIN
     );
   END IF;
 
-  -- Window is still active: check attempt limit
+  -- 3. Window is active: check attempt limit
   IF v_rec.attempts >= p_max_attempts THEN
     IF p_lockout_seconds > 0 THEN
       UPDATE public.rate_limits
@@ -120,7 +131,7 @@ BEGIN
     END IF;
   END IF;
 
-  -- Increment attempts
+  -- 4. Within limits: increment attempts
   UPDATE public.rate_limits
   SET attempts = attempts + 1
   WHERE key = p_key;
@@ -174,7 +185,41 @@ REVOKE ALL ON FUNCTION public.set_updated_at() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.log_audit_event() FROM PUBLIC;
 
 -- ============================================================
--- 3. TABLE-LEVEL PRIVILEGE HARDENING
+-- 3. CROSS-TENANT CHILD RECORD INTEGRITY HARDENING
+-- ============================================================
+
+-- Enforce that products can only be attached to categories belonging to the exact same restaurant
+DROP POLICY IF EXISTS "Staff can create products" ON public.products;
+CREATE POLICY "Staff can create products"
+ON public.products
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  (is_owner(restaurant_id) OR has_permission(restaurant_id, 'create_products'))
+  AND EXISTS (
+    SELECT 1 FROM public.categories c
+    WHERE c.id = products.category_id
+      AND c.restaurant_id = products.restaurant_id
+  )
+);
+
+DROP POLICY IF EXISTS "Staff can update products" ON public.products;
+CREATE POLICY "Staff can update products"
+ON public.products
+FOR UPDATE
+TO authenticated
+USING (is_owner(restaurant_id) OR has_permission(restaurant_id, 'update_products'))
+WITH CHECK (
+  (is_owner(restaurant_id) OR has_permission(restaurant_id, 'update_products'))
+  AND EXISTS (
+    SELECT 1 FROM public.categories c
+    WHERE c.id = products.category_id
+      AND c.restaurant_id = products.restaurant_id
+  )
+);
+
+-- ============================================================
+-- 4. TABLE-LEVEL PRIVILEGE HARDENING
 -- ============================================================
 
 -- Explicitly ensure anonymous role cannot perform state modifications

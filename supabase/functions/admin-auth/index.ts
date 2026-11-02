@@ -71,61 +71,15 @@ function jsonResponse(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Client IP Extraction
-// ---------------------------------------------------------------------------
-function getClientIp(req: Request): string {
-  const cfConnectingIp = req.headers.get("cf-connecting-ip");
-  if (cfConnectingIp) return cfConnectingIp.trim();
-
-  const xForwardedFor = req.headers.get("x-forwarded-for");
-  if (xForwardedFor) {
-    const first = xForwardedFor.split(",")[0]?.trim();
-    if (first) return first;
-  }
-
-  const xRealIp = req.headers.get("x-real-ip");
-  if (xRealIp) return xRealIp.trim();
-
-  return "unknown-ip";
-}
-
-// ---------------------------------------------------------------------------
-// Persistent Distributed Rate Limiting (Supabase Database RPC)
-// ---------------------------------------------------------------------------
-interface RateLimitResult {
-  allowed: boolean;
-  remaining_attempts: number;
-  retry_after: number;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function checkRateLimit(
-  supabaseAdmin: any,
-  key: string,
-  maxAttempts: number,
-  windowSeconds: number,
-  lockoutSeconds = 0
-): Promise<RateLimitResult> {
-  try {
-    const { data, error } = await supabaseAdmin.rpc("check_rate_limit", {
-      p_key: key,
-      p_max_attempts: maxAttempts,
-      p_window_seconds: windowSeconds,
-      p_lockout_seconds: lockoutSeconds,
-    });
-
-    if (error || !data) {
-      console.warn("Rate limit check failed or uninitialized:", error?.message);
-      // Fallback: allow request if rate limit table is not yet migrated, to avoid total outage
-      return { allowed: true, remaining_attempts: 1, retry_after: 0 };
-    }
-
-    return data as RateLimitResult;
-  } catch (err) {
-    console.warn("Rate limit check exception:", err);
-    return { allowed: true, remaining_attempts: 1, retry_after: 0 };
-  }
+function serviceUnavailableResponse(requestOrigin: string | null = null) {
+  return jsonResponse(
+    {
+      error: "Security verification service is temporarily unavailable. Please try again shortly.",
+    },
+    503,
+    requestOrigin,
+    { "Retry-After": "30" }
+  );
 }
 
 function rateLimitResponse(retryAfter: number, requestOrigin: string | null = null) {
@@ -138,6 +92,97 @@ function rateLimitResponse(retryAfter: number, requestOrigin: string | null = nu
     requestOrigin,
     { "Retry-After": String(retryAfter || 60) }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Client IP Extraction with Validation
+// ---------------------------------------------------------------------------
+function isValidIp(ip: string): boolean {
+  const ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+  const ipv6 = /^[0-9a-fA-F:]+$/;
+  return ipv4.test(ip) || (ip.includes(":") && ipv6.test(ip));
+}
+
+function getClientIp(req: Request): string {
+  // In Supabase Edge Functions on Cloudflare infrastructure, CF-Connecting-IP is
+  // set directly by Cloudflare edge and cannot be forged by client request headers.
+  const cfConnectingIp = req.headers.get("cf-connecting-ip");
+  if (cfConnectingIp && isValidIp(cfConnectingIp.trim())) {
+    return cfConnectingIp.trim();
+  }
+
+  // Trusted proxy real-ip header
+  const xRealIp = req.headers.get("x-real-ip");
+  if (xRealIp && isValidIp(xRealIp.trim())) {
+    return xRealIp.trim();
+  }
+
+  // Fallback to x-forwarded-for: inspect entries from right-to-left (nearest proxy hop)
+  const xForwardedFor = req.headers.get("x-forwarded-for");
+  if (xForwardedFor) {
+    const parts = xForwardedFor.split(",").map((p) => p.trim()).filter(Boolean);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (isValidIp(parts[i])) {
+        return parts[i];
+      }
+    }
+  }
+
+  return "unknown-client";
+}
+
+// ---------------------------------------------------------------------------
+// Persistent Distributed Rate Limiting (FAIL-CLOSED)
+// ---------------------------------------------------------------------------
+type RateLimitStatus =
+  | { status: "allowed"; remaining_attempts: number; retry_after: 0 }
+  | { status: "rate_limited"; remaining_attempts: 0; retry_after: number }
+  | { status: "unavailable"; error_message: string };
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function checkRateLimit(
+  supabaseAdmin: any,
+  key: string,
+  maxAttempts: number,
+  windowSeconds: number,
+  lockoutSeconds = 0
+): Promise<RateLimitStatus> {
+  try {
+    const { data, error } = await supabaseAdmin.rpc("check_rate_limit", {
+      p_key: key,
+      p_max_attempts: maxAttempts,
+      p_window_seconds: windowSeconds,
+      p_lockout_seconds: lockoutSeconds,
+    });
+
+    if (error) {
+      console.error(`[SECURITY RATE-LIMIT ERROR] Key [${key}]: ${error.message}`);
+      return { status: "unavailable", error_message: error.message };
+    }
+
+    if (!data || typeof data.allowed !== "boolean") {
+      console.error(`[SECURITY RATE-LIMIT ERROR] Malformed response for key [${key}]`);
+      return { status: "unavailable", error_message: "Malformed response" };
+    }
+
+    if (data.allowed) {
+      return {
+        status: "allowed",
+        remaining_attempts: Number(data.remaining_attempts) || 0,
+        retry_after: 0,
+      };
+    } else {
+      return {
+        status: "rate_limited",
+        remaining_attempts: 0,
+        retry_after: Number(data.retry_after) || 60,
+      };
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[SECURITY RATE-LIMIT EXCEPTION] Key [${key}]: ${msg}`);
+    return { status: "unavailable", error_message: msg };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,10 +245,23 @@ serve(async (req: Request) => {
   // 4. Content-Type Validation
   const contentType = req.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("application/json")) {
-    return jsonResponse({ error: "Unsupported Media Type. Content-Type must be application/json." }, 415, requestOrigin);
+    return jsonResponse(
+      { error: "Unsupported Media Type. Content-Type must be application/json." },
+      415,
+      requestOrigin
+    );
   }
 
-  // 5. Environment & Supabase Client Initialization
+  // 5. Payload Size Protection (Max 64 KB)
+  const contentLengthHeader = req.headers.get("content-length");
+  if (contentLengthHeader) {
+    const contentLength = parseInt(contentLengthHeader, 10);
+    if (!isNaN(contentLength) && contentLength > 65536) {
+      return jsonResponse({ error: "Payload too large. Max request size is 64KB." }, 413, requestOrigin);
+    }
+  }
+
+  // 6. Environment & Supabase Client Initialization
   const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
   const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -219,7 +277,7 @@ serve(async (req: Request) => {
   const supabaseAnon = createClient(supabaseUrl, supabaseAnonKey);
   const clientIp = getClientIp(req);
 
-  // 6. Request Body Parsing
+  // 7. Request Body Parsing
   let body: Record<string, unknown>;
   try {
     body = await req.json();
@@ -227,20 +285,31 @@ serve(async (req: Request) => {
     return jsonResponse({ error: "Invalid JSON body format." }, 400, requestOrigin);
   }
 
+  const ALLOWED_ACTIONS = new Set([
+    "check_setup_status",
+    "setup_initial_owner",
+    "login",
+    "create_admin",
+    "change_password",
+  ]);
+
   const { action } = body;
-  if (!action || typeof action !== "string") {
-    return jsonResponse({ error: "Action is required." }, 400, requestOrigin);
+  if (!action || typeof action !== "string" || !ALLOWED_ACTIONS.has(action)) {
+    return jsonResponse({ error: "Invalid or unsupported action." }, 400, requestOrigin);
   }
 
   try {
     // ========================================================
-    // 1. CHECK SETUP STATUS (Public / Unauthenticated)
+    // 1. CHECK SETUP STATUS (Public / Read-Only / Fail-Closed)
     // ========================================================
     if (action === "check_setup_status") {
-      // IP rate limit on status checks: max 60 per minute
       const ipRl = await checkRateLimit(supabaseAdmin, `status:ip:${clientIp}`, 60, 60);
-      if (!ipRl.allowed) {
+      if (ipRl.status === "rate_limited") {
         return rateLimitResponse(ipRl.retry_after, requestOrigin);
+      }
+      if (ipRl.status === "unavailable") {
+        // Fail-closed: triggers error boundary in frontend, preventing setup form exposure
+        return serviceUnavailableResponse(requestOrigin);
       }
 
       const { count, error: countErr } = await supabaseAdmin
@@ -273,10 +342,10 @@ serve(async (req: Request) => {
     }
 
     // ========================================================
-    // 2. SETUP INITIAL OWNER (First-Time Setup Wizard)
+    // 2. SETUP INITIAL OWNER (Protected First-Time Setup Wizard)
     // ========================================================
     if (action === "setup_initial_owner") {
-      // Persistent rate limit: max 5 setup attempts per 10 minutes per IP
+      // Fail-closed persistent rate limiting: max 5 setup attempts per 10 minutes per IP
       const setupRl = await checkRateLimit(
         supabaseAdmin,
         `setup:ip:${clientIp}`,
@@ -284,8 +353,11 @@ serve(async (req: Request) => {
         600,
         1800
       );
-      if (!setupRl.allowed) {
+      if (setupRl.status === "rate_limited") {
         return rateLimitResponse(setupRl.retry_after, requestOrigin);
+      }
+      if (setupRl.status === "unavailable") {
+        return serviceUnavailableResponse(requestOrigin);
       }
 
       const username = typeof body.username === "string" ? body.username.trim() : "";
@@ -398,13 +470,16 @@ serve(async (req: Request) => {
     }
 
     // ========================================================
-    // 3. LOGIN
+    // 3. LOGIN (Dual-Keyed Fail-Closed Rate Limiting)
     // ========================================================
     if (action === "login") {
-      // 1. IP-based rate limiting (20 requests per minute)
+      // 1. IP-level rate limit (20 requests per minute)
       const ipRl = await checkRateLimit(supabaseAdmin, `login:ip:${clientIp}`, 20, 60);
-      if (!ipRl.allowed) {
+      if (ipRl.status === "rate_limited") {
         return rateLimitResponse(ipRl.retry_after, requestOrigin);
+      }
+      if (ipRl.status === "unavailable") {
+        return serviceUnavailableResponse(requestOrigin);
       }
 
       const username = typeof body.username === "string" ? body.username.trim() : "";
@@ -438,8 +513,11 @@ serve(async (req: Request) => {
       if (ruError || !ruCandidates || ruCandidates.length === 0) {
         // Register failed attempt without leaking username non-existence
         const userRl = await checkRateLimit(supabaseAdmin, userRlKey, 5, 300, 900);
-        if (!userRl.allowed) {
+        if (userRl.status === "rate_limited") {
           return rateLimitResponse(userRl.retry_after, requestOrigin);
+        }
+        if (userRl.status === "unavailable") {
+          return serviceUnavailableResponse(requestOrigin);
         }
         return jsonResponse({ error: "Invalid username or password." }, 401, requestOrigin);
       }
@@ -484,8 +562,11 @@ serve(async (req: Request) => {
       if (!authenticatedRu || !authenticatedSession) {
         // Increment failed attempt counter on bad password
         const userRl = await checkRateLimit(supabaseAdmin, userRlKey, 5, 300, 900);
-        if (!userRl.allowed) {
+        if (userRl.status === "rate_limited") {
           return rateLimitResponse(userRl.retry_after, requestOrigin);
+        }
+        if (userRl.status === "unavailable") {
+          return serviceUnavailableResponse(requestOrigin);
         }
         return jsonResponse({ error: "Invalid username or password." }, 401, requestOrigin);
       }
@@ -507,7 +588,7 @@ serve(async (req: Request) => {
     }
 
     // ========================================================
-    // 4. CREATE ADMIN (Owner Only)
+    // 4. CREATE ADMIN (Owner Only / Fail-Closed Rate Limiting)
     // ========================================================
     if (action === "create_admin") {
       const ownerCheck = await verifyOwner(req, supabaseAdmin);
@@ -526,8 +607,11 @@ serve(async (req: Request) => {
         15,
         600
       );
-      if (!adminCreateRl.allowed) {
+      if (adminCreateRl.status === "rate_limited") {
         return rateLimitResponse(adminCreateRl.retry_after, requestOrigin);
+      }
+      if (adminCreateRl.status === "unavailable") {
+        return serviceUnavailableResponse(requestOrigin);
       }
 
       const restaurantId = ownerCheck.restaurantId;
@@ -676,7 +760,7 @@ serve(async (req: Request) => {
     }
 
     // ========================================================
-    // 5. CHANGE PASSWORD (Owner Only)
+    // 5. CHANGE PASSWORD (Owner Only / Fail-Closed Rate Limiting)
     // ========================================================
     if (action === "change_password") {
       const ownerCheck = await verifyOwner(req, supabaseAdmin);
@@ -695,8 +779,11 @@ serve(async (req: Request) => {
         15,
         600
       );
-      if (!pwChangeRl.allowed) {
+      if (pwChangeRl.status === "rate_limited") {
         return rateLimitResponse(pwChangeRl.retry_after, requestOrigin);
+      }
+      if (pwChangeRl.status === "unavailable") {
+        return serviceUnavailableResponse(requestOrigin);
       }
 
       const restaurantId = ownerCheck.restaurantId;
@@ -755,7 +842,8 @@ serve(async (req: Request) => {
 
     return jsonResponse({ error: "Invalid action." }, 400, requestOrigin);
   } catch (err: unknown) {
-    console.error("Internal error in admin-auth:", err);
+    const errorMsg = err instanceof Error ? err.message : "Unexpected server error";
+    console.error(`[SECURITY UNEXPECTED ERROR] Action [${action}]: ${errorMsg}`);
     return jsonResponse(
       { error: "An unexpected server error occurred." },
       500,
