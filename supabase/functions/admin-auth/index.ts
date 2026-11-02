@@ -2,55 +2,146 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ---------------------------------------------------------------------------
-// CORS — explicit origin allowlist.
-// The customer menu never calls this function (it uses the public REST API).
-// Wildcard CORS on a privileged endpoint allows any website to issue
-// authenticated administrative requests from a victim's browser session.
+// Dynamic CORS & Origin Allowlist
 // ---------------------------------------------------------------------------
-const ALLOWED_ORIGINS = [
-  // Production admin dashboard — set ADMIN_DASHBOARD_URL in Supabase Edge Function secrets
-  // and replace the placeholder below with your actual Vercel deployment URL.
-  "https://admin.yourdomain.com",
-  // Local development
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-];
+function getAllowedOrigins(): string[] {
+  const localDefaults = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ];
+
+  const origins = new Set<string>(localDefaults);
+
+  // Read production admin dashboard URL from Supabase Edge Function environment
+  const adminUrl = Deno.env.get("ADMIN_DASHBOARD_URL");
+  if (adminUrl) {
+    const trimmed = adminUrl.trim().replace(/\/+$/, "");
+    if (trimmed) origins.add(trimmed);
+  }
+
+  // Read comma-separated origins if configured
+  const envAllowed = Deno.env.get("ALLOWED_ORIGINS");
+  if (envAllowed) {
+    envAllowed.split(",").forEach((item) => {
+      const trimmed = item.trim().replace(/\/+$/, "");
+      if (trimmed) origins.add(trimmed);
+    });
+  }
+
+  return Array.from(origins);
+}
+
+function isOriginAllowed(requestOrigin: string | null): boolean {
+  // Non-browser clients (curl, backend-to-backend) do not send Origin header
+  if (!requestOrigin) return true;
+  const allowed = getAllowedOrigins();
+  return allowed.includes(requestOrigin);
+}
 
 function getCorsHeaders(requestOrigin: string | null): Record<string, string> {
-  // Reflect the origin only if it is in the allowlist.
-  // Non-listed origins receive the first entry, which will not match their
-  // actual origin and the browser will block the preflight.
-  const origin =
-    requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)
-      ? requestOrigin
-      : ALLOWED_ORIGINS[0];
-  return {
-    "Access-Control-Allow-Origin": origin,
+  const headers: Record<string, string> = {
     "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Vary": "Origin",
   };
+
+  // Only reflect origin if it matches our allowlist
+  if (requestOrigin && isOriginAllowed(requestOrigin)) {
+    headers["Access-Control-Allow-Origin"] = requestOrigin;
+  }
+
+  return headers;
 }
 
 function jsonResponse(
   data: Record<string, unknown>,
   status = 200,
-  requestOrigin: string | null = null
+  requestOrigin: string | null = null,
+  extraHeaders: Record<string, string> = {}
 ) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       ...getCorsHeaders(requestOrigin),
       "Content-Type": "application/json",
+      ...extraHeaders,
     },
   });
 }
 
 // ---------------------------------------------------------------------------
-// verifyOwner — confirm the caller is an active restaurant owner.
-// Uses the admin client to cryptographically verify the JWT via getUser().
+// Client IP Extraction
+// ---------------------------------------------------------------------------
+function getClientIp(req: Request): string {
+  const cfConnectingIp = req.headers.get("cf-connecting-ip");
+  if (cfConnectingIp) return cfConnectingIp.trim();
+
+  const xForwardedFor = req.headers.get("x-forwarded-for");
+  if (xForwardedFor) {
+    const first = xForwardedFor.split(",")[0]?.trim();
+    if (first) return first;
+  }
+
+  const xRealIp = req.headers.get("x-real-ip");
+  if (xRealIp) return xRealIp.trim();
+
+  return "unknown-ip";
+}
+
+// ---------------------------------------------------------------------------
+// Persistent Distributed Rate Limiting (Supabase Database RPC)
+// ---------------------------------------------------------------------------
+interface RateLimitResult {
+  allowed: boolean;
+  remaining_attempts: number;
+  retry_after: number;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function checkRateLimit(
+  supabaseAdmin: any,
+  key: string,
+  maxAttempts: number,
+  windowSeconds: number,
+  lockoutSeconds = 0
+): Promise<RateLimitResult> {
+  try {
+    const { data, error } = await supabaseAdmin.rpc("check_rate_limit", {
+      p_key: key,
+      p_max_attempts: maxAttempts,
+      p_window_seconds: windowSeconds,
+      p_lockout_seconds: lockoutSeconds,
+    });
+
+    if (error || !data) {
+      console.warn("Rate limit check failed or uninitialized:", error?.message);
+      // Fallback: allow request if rate limit table is not yet migrated, to avoid total outage
+      return { allowed: true, remaining_attempts: 1, retry_after: 0 };
+    }
+
+    return data as RateLimitResult;
+  } catch (err) {
+    console.warn("Rate limit check exception:", err);
+    return { allowed: true, remaining_attempts: 1, retry_after: 0 };
+  }
+}
+
+function rateLimitResponse(retryAfter: number, requestOrigin: string | null = null) {
+  return jsonResponse(
+    {
+      error: "Too many requests. Please try again later.",
+      retry_after: retryAfter,
+    },
+    429,
+    requestOrigin,
+    { "Retry-After": String(retryAfter || 60) }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// verifyOwner — confirm caller is an active restaurant owner via JWT
 // ---------------------------------------------------------------------------
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function verifyOwner(req: Request, supabaseAdmin: any) {
@@ -83,26 +174,42 @@ async function verifyOwner(req: Request, supabaseAdmin: any) {
 }
 
 // ---------------------------------------------------------------------------
-// Main handler
+// Main Handler
 // ---------------------------------------------------------------------------
 serve(async (req: Request) => {
   const requestOrigin = req.headers.get("Origin");
 
-  // Handle CORS preflight
+  // 1. CORS Preflight Handling
   if (req.method === "OPTIONS") {
+    if (requestOrigin && !isOriginAllowed(requestOrigin)) {
+      return new Response("CORS origin forbidden", { status: 403 });
+    }
     return new Response("ok", { headers: getCorsHeaders(requestOrigin) });
   }
 
+  // 2. HTTP Method Validation
   if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed" }, 405, requestOrigin);
+    return jsonResponse({ error: "Method not allowed. Use POST." }, 405, requestOrigin);
   }
 
+  // 3. Origin Rejection for POST requests from untrusted browser origins
+  if (requestOrigin && !isOriginAllowed(requestOrigin)) {
+    return jsonResponse({ error: "Unauthorized request origin." }, 403, requestOrigin);
+  }
+
+  // 4. Content-Type Validation
+  const contentType = req.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return jsonResponse({ error: "Unsupported Media Type. Content-Type must be application/json." }, 415, requestOrigin);
+  }
+
+  // 5. Environment & Supabase Client Initialization
   const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
   const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
   if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceKey) {
-    return jsonResponse({ error: "Server configuration missing" }, 500, requestOrigin);
+    return jsonResponse({ error: "Server configuration missing." }, 500, requestOrigin);
   }
 
   const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
@@ -110,21 +217,32 @@ serve(async (req: Request) => {
   });
 
   const supabaseAnon = createClient(supabaseUrl, supabaseAnonKey);
+  const clientIp = getClientIp(req);
 
+  // 6. Request Body Parsing
   let body: Record<string, unknown>;
   try {
     body = await req.json();
   } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400, requestOrigin);
+    return jsonResponse({ error: "Invalid JSON body format." }, 400, requestOrigin);
   }
 
   const { action } = body;
+  if (!action || typeof action !== "string") {
+    return jsonResponse({ error: "Action is required." }, 400, requestOrigin);
+  }
 
   try {
     // ========================================================
     // 1. CHECK SETUP STATUS (Public / Unauthenticated)
     // ========================================================
     if (action === "check_setup_status") {
+      // IP rate limit on status checks: max 60 per minute
+      const ipRl = await checkRateLimit(supabaseAdmin, `status:ip:${clientIp}`, 60, 60);
+      if (!ipRl.allowed) {
+        return rateLimitResponse(ipRl.retry_after, requestOrigin);
+      }
+
       const { count, error: countErr } = await supabaseAdmin
         .from("restaurant_users")
         .select("user_id", { count: "exact", head: true })
@@ -155,9 +273,21 @@ serve(async (req: Request) => {
     }
 
     // ========================================================
-    // 2. SETUP INITIAL OWNER (Protected First-Time Setup Wizard)
+    // 2. SETUP INITIAL OWNER (First-Time Setup Wizard)
     // ========================================================
     if (action === "setup_initial_owner") {
+      // Persistent rate limit: max 5 setup attempts per 10 minutes per IP
+      const setupRl = await checkRateLimit(
+        supabaseAdmin,
+        `setup:ip:${clientIp}`,
+        5,
+        600,
+        1800
+      );
+      if (!setupRl.allowed) {
+        return rateLimitResponse(setupRl.retry_after, requestOrigin);
+      }
+
       const username = typeof body.username === "string" ? body.username.trim() : "";
       const password = typeof body.password === "string" ? body.password : "";
       const restaurantName =
@@ -197,8 +327,7 @@ serve(async (req: Request) => {
         );
       }
 
-      // 1. Create Supabase Auth user with a random internal identifier.
-      //    The internal email is never exposed to the frontend.
+      // Create Supabase Auth user with random internal identifier
       const internalEmail = `owner_${crypto.randomUUID()}@auth.local`;
       const { data: newAuthData, error: createAuthError } =
         await supabaseAdmin.auth.admin.createUser({
@@ -217,19 +346,9 @@ serve(async (req: Request) => {
 
       const ownerUserId = newAuthData.user.id;
 
-      // 2. Atomically link owner & restaurant via the dedicated database function.
-      //
-      //    setup_first_owner:
-      //    - Acquires a transaction-level advisory lock (pg_advisory_xact_lock) to
-      //      prevent concurrent setup races.
-      //    - Re-checks the owner count inside the transaction.
-      //    - Raises an exception if setup is already complete.
-      //    - Inserts the restaurant row (or updates the existing seed row) and the
-      //      restaurant_users owner row atomically.
-      //
-      //    There is NO fallback path. If the RPC fails for ANY reason — already
-      //    complete, constraint violation, DB error, or anything else — we clean up
-      //    the orphaned auth user and return a safe error to the caller.
+      // Atomically link owner and restaurant via setup_first_owner RPC
+      // The RPC takes pg_advisory_xact_lock(742918451) and re-verifies owner count.
+      // There is NO direct-insert fallback.
       const slug =
         restaurantName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") ||
         "restaurant";
@@ -245,7 +364,7 @@ serve(async (req: Request) => {
       );
 
       if (rpcErr || !rpcRestaurantId) {
-        // Always clean up the orphaned auth user on any RPC failure.
+        // Rollback: purge the orphaned Auth user on RPC failure
         await supabaseAdmin.auth.admin.deleteUser(ownerUserId);
 
         if (rpcErr?.message?.includes("already been completed")) {
@@ -258,7 +377,7 @@ serve(async (req: Request) => {
             requestOrigin
           );
         }
-        // Surface DB validation errors (e.g. username length) but redact internal details.
+
         const safeMessage =
           rpcErr?.message?.includes("Username must be")
             ? rpcErr.message
@@ -282,6 +401,12 @@ serve(async (req: Request) => {
     // 3. LOGIN
     // ========================================================
     if (action === "login") {
+      // 1. IP-based rate limiting (20 requests per minute)
+      const ipRl = await checkRateLimit(supabaseAdmin, `login:ip:${clientIp}`, 20, 60);
+      if (!ipRl.allowed) {
+        return rateLimitResponse(ipRl.retry_after, requestOrigin);
+      }
+
       const username = typeof body.username === "string" ? body.username.trim() : "";
       const password = typeof body.password === "string" ? body.password : "";
 
@@ -293,11 +418,16 @@ serve(async (req: Request) => {
         );
       }
 
-      // Look up candidates in restaurant_users by username (case-insensitive)
+      const cleanUsername = username.toLowerCase();
+
+      // 2. Account-level rate limiting: max 5 failed attempts per 5 minutes, 15m lockout
+      const userRlKey = `login:user:${cleanUsername}`;
+
+      // Look up candidate accounts in restaurant_users (case-insensitive)
       let ruQuery = supabaseAdmin
         .from("restaurant_users")
         .select("*")
-        .ilike("username", username);
+        .ilike("username", cleanUsername);
 
       if (typeof body.restaurant_id === "string" && body.restaurant_id.trim()) {
         ruQuery = ruQuery.eq("restaurant_id", body.restaurant_id.trim());
@@ -306,6 +436,11 @@ serve(async (req: Request) => {
       const { data: ruCandidates, error: ruError } = await ruQuery;
 
       if (ruError || !ruCandidates || ruCandidates.length === 0) {
+        // Register failed attempt without leaking username non-existence
+        const userRl = await checkRateLimit(supabaseAdmin, userRlKey, 5, 300, 900);
+        if (!userRl.allowed) {
+          return rateLimitResponse(userRl.retry_after, requestOrigin);
+        }
         return jsonResponse({ error: "Invalid username or password." }, 401, requestOrigin);
       }
 
@@ -313,7 +448,7 @@ serve(async (req: Request) => {
       let authenticatedSession = null;
       let hasInactiveMatch = false;
 
-      // Authenticate across candidate accounts
+      // Authenticate against candidates
       for (const candidate of ruCandidates) {
         const { data: authUserRes, error: authUserError } =
           await supabaseAdmin.auth.admin.getUserById(candidate.user_id);
@@ -347,10 +482,15 @@ serve(async (req: Request) => {
       }
 
       if (!authenticatedRu || !authenticatedSession) {
+        // Increment failed attempt counter on bad password
+        const userRl = await checkRateLimit(supabaseAdmin, userRlKey, 5, 300, 900);
+        if (!userRl.allowed) {
+          return rateLimitResponse(userRl.retry_after, requestOrigin);
+        }
         return jsonResponse({ error: "Invalid username or password." }, 401, requestOrigin);
       }
 
-      // Return authenticated session to client (internal email is NOT exposed)
+      // Return session data; internal email is NEVER returned to client
       return jsonResponse(
         {
           session: authenticatedSession,
@@ -377,6 +517,17 @@ serve(async (req: Request) => {
           ownerCheck.status ?? 403,
           requestOrigin
         );
+      }
+
+      // Rate limit admin creations: max 15 per 10 minutes per owner
+      const adminCreateRl = await checkRateLimit(
+        supabaseAdmin,
+        `create_admin:owner:${ownerCheck.user.id}`,
+        15,
+        600
+      );
+      if (!adminCreateRl.allowed) {
+        return rateLimitResponse(adminCreateRl.retry_after, requestOrigin);
       }
 
       const restaurantId = ownerCheck.restaurantId;
@@ -428,7 +579,7 @@ serve(async (req: Request) => {
         return jsonResponse({ error: "Username is already in use." }, 400, requestOrigin);
       }
 
-      // Create Supabase Auth user with a random internal identifier
+      // Create Supabase Auth user with internal identifier
       const internalEmail = `admin_${crypto.randomUUID()}@auth.local`;
       const { data: newAuthData, error: createAuthError } =
         await supabaseAdmin.auth.admin.createUser({
@@ -447,7 +598,7 @@ serve(async (req: Request) => {
 
       const newAuthUserId = newAuthData.user.id;
 
-      // Create restaurant_users record
+      // Create restaurant_users row
       const { data: newRu, error: insertRuError } = await supabaseAdmin
         .from("restaurant_users")
         .insert({
@@ -469,7 +620,7 @@ serve(async (req: Request) => {
         );
       }
 
-      // Validate and insert admin permissions against an explicit allowlist
+      // Validate and insert admin permissions against strict allowlist
       const VALID_PERMISSIONS = new Set([
         "view_categories", "create_categories", "update_categories", "delete_categories",
         "view_products", "create_products", "update_products", "delete_products",
@@ -489,7 +640,7 @@ serve(async (req: Request) => {
         await supabaseAdmin.from("admin_permissions").insert(permRows);
       }
 
-      // Record audit log (non-blocking)
+      // Record audit log
       try {
         await supabaseAdmin.from("audit_logs").insert({
           restaurant_id: restaurantId,
@@ -537,6 +688,17 @@ serve(async (req: Request) => {
         );
       }
 
+      // Rate limit password changes: max 15 per 10 minutes per owner
+      const pwChangeRl = await checkRateLimit(
+        supabaseAdmin,
+        `change_pw:owner:${ownerCheck.user.id}`,
+        15,
+        600
+      );
+      if (!pwChangeRl.allowed) {
+        return rateLimitResponse(pwChangeRl.retry_after, requestOrigin);
+      }
+
       const restaurantId = ownerCheck.restaurantId;
       const targetUserId =
         typeof body.target_user_id === "string" ? body.target_user_id : "";
@@ -550,7 +712,7 @@ serve(async (req: Request) => {
         );
       }
 
-      // Verify target user belongs to the same restaurant
+      // Verify target user belongs to same restaurant
       const { data: targetRu, error: targetRuError } = await supabaseAdmin
         .from("restaurant_users")
         .select("user_id, username")
@@ -573,7 +735,7 @@ serve(async (req: Request) => {
         return jsonResponse({ error: "Failed to update password." }, 500, requestOrigin);
       }
 
-      // Record audit log (non-blocking)
+      // Record audit log
       try {
         await supabaseAdmin.from("audit_logs").insert({
           restaurant_id: restaurantId,

@@ -36,6 +36,7 @@ type SetupFormData = z.infer<typeof setupSchema>;
 export function SetupPage() {
   const navigate = useNavigate();
   const [checkingStatus, setCheckingStatus] = useState(true);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
@@ -58,29 +59,38 @@ export function SetupPage() {
     },
   });
 
-  useEffect(() => {
-    async function checkStatus() {
-      try {
-        const { data, error } = await supabase.functions.invoke('admin-auth', {
-          body: { action: 'check_setup_status' },
-        });
+  const checkStatus = async () => {
+    setCheckingStatus(true);
+    setStatusError(null);
+    try {
+      const { data, error } = await supabase.functions.invoke('admin-auth', {
+        body: { action: 'check_setup_status' },
+      });
 
-        if (error || !data) {
-          // If edge function check fails or unavailable, assume manual setup is allowed or check via fallback
-          setSetupRequired(true);
-        } else {
-          setSetupRequired(Boolean(data.is_setup_required));
-          if (data.restaurant_name && data.restaurant_name !== 'Demo Restaurant') {
-            setValue('restaurantName', data.restaurant_name);
-          }
+      if (error || !data) {
+        // Fail-closed: Never assume setup is required if check fails or returns error
+        setStatusError(
+          error?.message ||
+            'Unable to securely verify system setup status from the server. Please check your network and Supabase configuration.'
+        );
+        setSetupRequired(null);
+      } else {
+        setSetupRequired(Boolean(data.is_setup_required));
+        if (data.restaurant_name && data.restaurant_name !== 'Demo Restaurant') {
+          setValue('restaurantName', data.restaurant_name);
         }
-      } catch {
-        setSetupRequired(true);
-      } finally {
-        setCheckingStatus(false);
       }
+    } catch (err: unknown) {
+      // Fail-closed
+      const msg = err instanceof Error ? err.message : 'Connection to authentication service failed.';
+      setStatusError(msg);
+      setSetupRequired(null);
+    } finally {
+      setCheckingStatus(false);
     }
+  };
 
+  useEffect(() => {
     checkStatus();
   }, [setValue]);
 
@@ -121,7 +131,35 @@ export function SetupPage() {
     );
   }
 
-  if (setupRequired === false && !isCompleted) {
+  // Fail-closed state: never expose the setup form if status could not be verified
+  if (statusError) {
+    return (
+      <div className="min-h-screen bg-[var(--color-bg)] flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-[var(--color-surface)] border border-[var(--color-border)] rounded-[var(--radius-xl)] p-8 shadow-[var(--shadow-lg)] text-center">
+          <div className="w-14 h-14 rounded-[var(--radius-lg)] bg-[var(--color-danger-bg)] text-[var(--color-danger)] flex items-center justify-center mx-auto mb-4">
+            <ShieldAlert size={28} />
+          </div>
+          <h2 className="text-xl font-bold text-[var(--color-text)] mb-2">Verification Failed</h2>
+          <p className="text-sm text-[var(--color-text-2)] mb-4">
+            {statusError}
+          </p>
+          <p className="text-xs text-[var(--color-text-3)] mb-6">
+            For security reasons, setup cannot proceed until server status is verified.
+          </p>
+          <div className="flex flex-col gap-3">
+            <Button variant="primary" className="w-full" onClick={checkStatus}>
+              Retry Verification
+            </Button>
+            <Button variant="secondary" className="w-full" onClick={() => navigate('/login', { replace: true })}>
+              Back to Login
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!setupRequired && !isCompleted) {
     return (
       <div className="min-h-screen bg-[var(--color-bg)] flex items-center justify-center p-4">
         <div className="w-full max-w-md bg-[var(--color-surface)] border border-[var(--color-border)] rounded-[var(--radius-xl)] p-8 shadow-[var(--shadow-lg)] text-center">
